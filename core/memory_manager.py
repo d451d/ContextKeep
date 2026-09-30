@@ -6,7 +6,7 @@ import html
 import json
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional
 
 from .database import APP_VERSION, Database, SCHEMA_VERSION, utcnow_iso
 
@@ -17,6 +17,16 @@ SENSITIVE_MARKER = "[masked credential memory]"
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
+
+
+def _count_occurrences(text: str, sub: str) -> int:
+    """Count occurrences of sub in text, including overlapping ones."""
+    count = 0
+    start = text.find(sub)
+    while start != -1:
+        count += 1
+        start = text.find(sub, start + 1)
+    return count
 
 
 class MemoryManager:
@@ -167,17 +177,24 @@ class MemoryManager:
         created_at: str | None = None,
         updated_at: str | None = None,
         source: str = "mcp",
+        history_action: str | None = None,
+        preserve_categories: bool = False,
     ) -> dict[str, Any]:
         if not key or not key.strip():
             raise ValueError("Memory key is required")
         key = key.strip()
         content = content or ""
-        category_names = self._parse_categories(categories) or ["Uncategorized"]
+        category_names = [] if preserve_categories else (self._parse_categories(categories) or ["Uncategorized"])
         now = updated_at or utcnow_iso()
         existing = self._memory_by_key(key)
         is_update = existing is not None
+        if preserve_categories and not is_update:
+            raise ValueError("preserve_categories requires an existing memory")
         created_at_final = existing["created_at"] if existing else (created_at or now)
-        resolved_title = (title or "").strip() or (existing["title"] if existing else key)
+        if preserve_categories:
+            resolved_title = existing["title"]
+        else:
+            resolved_title = (title or "").strip() or (existing["title"] if existing else key)
         legacy_json = (
             existing["legacy_tags"]
             if existing and legacy_tags is None
@@ -186,7 +203,24 @@ class MemoryManager:
 
         conn = self._conn()
         with conn:
-            if existing:
+            if preserve_categories:
+                # Only content and its derived columns; title and legacy_tags stay as stored.
+                conn.execute(
+                    """
+                    UPDATE memories
+                    SET content = ?, updated_at = ?, lines = ?, chars = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        content,
+                        now,
+                        len(content.splitlines()),
+                        len(content),
+                        existing["id"],
+                    ),
+                )
+                memory_id = int(existing["id"])
+            elif existing:
                 conn.execute(
                     """
                     UPDATE memories
@@ -235,20 +269,21 @@ class MemoryManager:
                     (memory_id,),
                 )
             }
-            conn.execute("DELETE FROM memory_categories WHERE memory_id = ?", (memory_id,))
-            for category_name in category_names:
-                category = self._ensure_category(category_name)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO memory_categories(memory_id, category_id, assigned_at)
-                    VALUES (?, ?, ?)
-                    """,
-                    (memory_id, category["id"], now),
-                )
+            if not preserve_categories:
+                conn.execute("DELETE FROM memory_categories WHERE memory_id = ?", (memory_id,))
+                for category_name in category_names:
+                    category = self._ensure_category(category_name)
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_categories(memory_id, category_id, assigned_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (memory_id, category["id"], now),
+                    )
 
-            self._recalculate_category_counts()
-            new_categories = set(category_names)
-            action = "updated" if is_update else "created"
+                self._recalculate_category_counts()
+            new_categories = old_categories if preserve_categories else set(category_names)
+            action = history_action or ("updated" if is_update else "created")
             self._log_history(
                 memory_id,
                 action,
@@ -280,6 +315,50 @@ class MemoryManager:
         if not row:
             return None
         return self._format_memory(row, include_history=True)
+
+    def patch_memory(self, key: str, old_str: str, new_str: str, source: str = "mcp") -> dict[str, Any]:
+        if not old_str:
+            raise ValueError("old_str must not be empty")
+
+        def edit(content: str) -> str:
+            count = _count_occurrences(content, old_str)
+            if count != 1:
+                problem = "not found" if count == 0 else "matches more than once"
+                raise ValueError(f"old_str {problem} in {key} ({count} matches); nothing changed")
+            return content.replace(old_str, new_str, 1)
+
+        return self._edit_content(key, edit, "patched", source)
+
+    def append_memory(self, key: str, text: str, source: str = "mcp") -> dict[str, Any]:
+        return self._edit_content(key, lambda content: content + "\n" + text, "appended", source)
+
+    def _edit_content(
+        self,
+        key: str,
+        edit: Callable[[str], str],
+        action: str,
+        source: str,
+    ) -> dict[str, Any]:
+        # Read and write in one IMMEDIATE transaction so a concurrent writer
+        # (e.g. the WebUI process) cannot change the record in between.
+        # store_memory's `with conn:` commits it.
+        conn = self._conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._memory_by_key(key)
+            if not row:
+                raise KeyError(f"Memory not found: {key}")
+            return self.store_memory(
+                key=row["key"],
+                content=edit(row["content"]),
+                source=source,
+                history_action=action,
+                preserve_categories=True,
+            )
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
     def list_categories(self) -> list[dict[str, Any]]:
         rows = self._conn().execute(
@@ -589,6 +668,8 @@ class MemoryManager:
             "database_id": meta.get("database_id", Database.database_id()),
             "tools": [
                 "store_memory",
+                "patch_memory",
+                "append_memory",
                 "retrieve_memory",
                 "search_memories",
                 "list_categories",

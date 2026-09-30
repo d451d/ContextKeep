@@ -43,6 +43,28 @@ async def store_memory(key: str, content: str, categories: str = "", title: str 
 
 
 @mcp.tool()
+async def patch_memory(key: str, old_str: str, new_str: str) -> str:
+    """Replace one exact, unique occurrence of old_str in a memory's content with new_str (empty new_str deletes it). Fails without changing anything if old_str matches 0 or 2+ times. Title and categories are kept."""
+    memory = memory_manager.patch_memory(key, old_str, new_str)
+    return (
+        f"Patched memory: {memory['key']}\n"
+        f"Characters: {memory['chars']}\n"
+        f"Updated: {memory['updated_at']}"
+    )
+
+
+@mcp.tool()
+async def append_memory(key: str, text: str) -> str:
+    """Append text to a memory's content on a new line. Title and categories are kept."""
+    memory = memory_manager.append_memory(key, text)
+    return (
+        f"Appended to memory: {memory['key']}\n"
+        f"Characters: {memory['chars']}\n"
+        f"Updated: {memory['updated_at']}"
+    )
+
+
+@mcp.tool()
 async def retrieve_memory(key: str) -> str:
     """Retrieve a memory by exact key."""
     memory = memory_manager.retrieve_memory(key)
